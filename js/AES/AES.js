@@ -396,6 +396,50 @@ function AES_CTR_xcrypt_buffer(ctx, buf, length) {
     }
 }
 
+function AES_CFB_encrypt_buffer(ctx, buf, length) {
+    let i;
+    let Iv = ctx.Iv;
+    for (i = 0; i < length; i += AES_BLOCKLEN) {
+        let state = bufToState(Iv, 0);
+        Cipher(state, ctx.RoundKey);
+        stateToBuf(state, Iv, 0);
+
+        XorWithIv(buf, i, Iv);
+        Iv.set(buf.subarray(i, i + AES_BLOCKLEN));
+    }
+}
+
+function AES_CFB_decrypt_buffer(ctx, buf, length) {
+    let i;
+    let storeNextIv = new Uint8Array(AES_BLOCKLEN);
+    let Iv = ctx.Iv;
+    for (i = 0; i < length; i += AES_BLOCKLEN) {
+        storeNextIv.set(buf.subarray(i, i + AES_BLOCKLEN));
+
+        let state = bufToState(Iv, 0);
+        Cipher(state, ctx.RoundKey);
+        stateToBuf(state, Iv, 0);
+
+        XorWithIv(buf, i, Iv);
+        Iv.set(storeNextIv);
+    }
+}
+
+function AES_OFB_encrypt_buffer(ctx, buf, length) {
+    let i;
+    let Iv = ctx.Iv;
+    for (i = 0; i < length; i += AES_BLOCKLEN) {
+        let state = bufToState(Iv, 0);
+        Cipher(state, ctx.RoundKey);
+        stateToBuf(state, Iv, 0);
+
+        XorWithIv(buf, i, Iv);
+    }
+}
+
+// OFB Decryption is same as Encryption
+const AES_OFB_decrypt_buffer = AES_OFB_encrypt_buffer;
+
 module.exports = {
     AES_ctx,
     AES_init_ctx,
@@ -405,5 +449,9 @@ module.exports = {
     AES_ECB_decrypt_buffer,
     AES_CBC_encrypt_buffer,
     AES_CBC_decrypt_buffer,
-    AES_CTR_xcrypt_buffer
+    AES_CTR_xcrypt_buffer,
+    AES_CFB_encrypt_buffer,
+    AES_CFB_decrypt_buffer,
+    AES_OFB_encrypt_buffer,
+    AES_OFB_decrypt_buffer
 };

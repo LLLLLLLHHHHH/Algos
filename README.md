@@ -14,7 +14,9 @@
 
 | 算法 | C 实现 | JS 实现 | 详细分析 | 说明 |
 | :--- | :---: | :---: | :---: | :--- |
-| **AES** | [C](c/AES) | [JS](js/AES) | [Analysis](README/AES.md) | 高级加密标准，支持 ECB/CBC/CTR 模式 |
+| **AES** | [C](c/AES) | [JS](js/AES) | [Analysis](README/AES.md) | 高级加密标准，支持 ECB/CBC/CTR/CFB/OFB/GCM/CCM/EAX 模式 |
+| **DES** | [C](c/DES) | [JS](js/DES) | [Analysis](README/DES.md) | 数据加密标准，支持 ECB/CBC/CTR/CFB/OFB |
+| **3DES** | [C](c/3DES) | [JS](js/3DES) | [Analysis](README/3DES.md) | 三重数据加密算法 (TDEA)，增强版 DES |
 | **SM4** | [C](c/SM4) | [JS](js/SM4) | [Analysis](README/SM4.md) | 国密分组密码算法 |
 | **ChaCha20** | [C](c/ChaCha20) | [JS](js/ChaCha20) | [Analysis](README/ChaCha20.md) | 高效流密码，RFC 7539 标准 |
 | **Salsa20** | [C](c/Salsa20) | [JS](js/Salsa20) | [Analysis](README/Salsa20.md) | ChaCha20 的前身，高性能流密码 |
@@ -40,6 +42,7 @@
 | **SHA-256** | [C](c/SHA256) | [JS](js/SHA256) | [Analysis](README/SHA256.md) | SHA-2 系列中最常用的变体 |
 | **SM3** | [C](c/SM3) | [JS](js/SM3) | [Analysis](README/SM3.md) | 国密密码杂凑算法 |
 | **MurmurHash** | [C](c/murmurhash) | [JS](js/murmurhash) | [Analysis](README/MurmurHash.md) | 高性能非加密哈希算法 |
+| **CRC32** | [C](c/CRC32) | [JS](js/CRC32) | [Analysis](README/CRC32.md) | 循环冗余校验 (IEEE 802.3) |
 
 ### 🔡 编码 (Encoding)
 

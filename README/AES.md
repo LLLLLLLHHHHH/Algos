@@ -4,7 +4,15 @@
 ## 1. 总结
 这是一个紧凑且可移植的 AES (Advanced Encryption Standard) 算法的 C 语言实现。
 - **支持标准**: 完整支持 AES-128, AES-192, 和 AES-256 标准（通过宏定义配置）。
-- **工作模式**: 实现了三种常用的工作模式：ECB (电子密码本), CBC (密码分组链接), 和 CTR (计数器模式)。
+- **工作模式**: 实现了八种标准工作模式：ECB, CBC, CTR, CFB, OFB, GCM, CCM, 和 EAX。
+  - **ECB (Electronic Codebook)**: 最基础模式，不推荐用于长数据。
+  - **CBC (Cipher Block Chaining)**: 广泛使用，需要 IV。
+  - **CTR (Counter)**: 并行化，高性能流密码模式。
+  - **CFB (Cipher Feedback)**: 自同步流密码模式。
+  - **OFB (Output Feedback)**: 同步流密码模式。
+  - **GCM (Galois/Counter Mode)**: 高性能 AEAD 模式，现代首选。
+  - **CCM (Counter with CBC-MAC)**: 低功耗 AEAD 模式 (ZigBee, WPA2)。
+  - **EAX**: 另一种两遍扫描的 AEAD 模式，CMAC + CTR。
 - **依赖**: 仅依赖标准 C 库 (`stdint.h`, `string.h`)，易于移植到嵌入式系统或其他平台。
 - **结构**: 代码结构清晰，将核心算法（轮函数）与工作模式解耦。
 
@@ -30,6 +38,8 @@
 1.  **ECB**: 最基础的模式，将数据分成块独立加密。**注意**: 不安全，不建议用于大于一个块的数据。
 2.  **CBC**: 引入了 IV，前一个密文块与当前明文块异或。**注意**: 需要处理填充（Padding），且不能并行加密。
 3.  **CTR**: 将 AES 变为流密码，通过加密计数器产生密钥流与明文异或。**特征**: 加解密使用同一个函数 (`AES_CTR_xcrypt_buffer`)，支持随机访问，可并行处理。
+4.  **CFB**: 密文反馈模式，类似于 CBC，但将块密码转变为自同步流密码。**特征**: 可以处理小于块大小的数据（虽然本实现假定块对齐），解密支持并行。
+8.  **EAX**: Encrypt-then-MAC 模式，提供认证加密 (AEAD)。**特征**: 结合了 CTR 模式（用于保密性）和 CMAC（用于完整性），是 CCM 的改进版，支持在线处理。
 
 ## 3. 魔改建议
 
@@ -48,8 +58,3 @@
 - **魔改 S-Box**: 生成一个新的 256 字节置换表及其逆表来替换标准的 `sbox`/`rsbox`。
 - **修改多项式**: 修改 `MixColumns` 中使用的乘法系数（目前是 0x02, 0x03, 0x01, 0x01）。
 - **修改轮数**: 调整 `Nr` 的值，减少轮数以提高速度（降低安全性），或增加轮数以提高安全性。
-
-### 功能扩展：GCM 模式
-当前只支持 ECB, CBC, CTR。
-- **魔改方向**: 基于 CTR 模式，增加 GMAC (Galois Message Authentication Code) 部分，实现 **GCM (Galois/Counter Mode)**。
-- **效果**: 提供认证加密 (Authenticated Encryption)，即同时保证数据的保密性和完整性，这是现代 TLS 等协议的首选模式。

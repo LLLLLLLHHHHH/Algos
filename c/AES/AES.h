@@ -54,3 +54,88 @@ void AES_CBC_decrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length);
 //   - 您需要通过 AES_init_ctx_iv() 或 AES_ctx_set_iv() 在上下文中设置 IV。
 //   - 永远不要使用相同的密钥重复使用 IV。
 void AES_CTR_xcrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length);
+
+// CFB (Cipher Feedback Mode)
+// 缓冲区大小必须是 AES_BLOCKLEN 的倍数
+void AES_CFB_encrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length);
+void AES_CFB_decrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length);
+
+// OFB (Output Feedback Mode)
+// 缓冲区大小必须是 AES_BLOCKLEN 的倍数
+void AES_OFB_encrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length);
+// OFB 解密与加密相同
+#define AES_OFB_decrypt_buffer AES_OFB_encrypt_buffer
+
+// GCM (Galois/Counter Mode)
+// GCM 是一种认证加密模式，提供保密性和完整性。
+// iv: 初始化向量 (推荐 12 字节)
+// iv_len: iv 长度
+// aad: 附加认证数据 (Additional Authenticated Data)，可以为 NULL
+// aad_len: aad 长度
+// input: 输入数据
+// output: 输出数据 (长度与 input 相同)
+// length: 数据长度
+// tag: 认证标签输出 (加密时) 或 输入 (解密时)
+// tag_len: 标签长度 (通常 16 字节)
+// 返回值: 解密成功返回 0，认证失败返回 1 (仅解密时有效)
+void AES_GCM_encrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len);
+
+int AES_GCM_decrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     const uint8_t* tag, size_t tag_len);
+
+// CCM (Counter with CBC-MAC)
+// CCM 是一种认证加密模式，提供保密性和完整性。
+// iv: Nonce (长度 7 到 13 字节)
+// iv_len: Nonce 长度
+// aad: 附加认证数据 (Additional Authenticated Data)
+// aad_len: aad 长度
+// input: 输入数据
+// output: 输出数据 (长度与 input 相同)
+// length: 数据长度
+// tag: 认证标签输出 (加密时) 或 输入 (解密时)
+// tag_len: 标签长度 (通常为 4, 6, 8, 10, 12, 14, 16 字节)
+// 返回值: 解密成功返回 0，认证失败返回 1 (仅解密时有效)
+void AES_CCM_encrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len);
+
+int AES_CCM_decrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     const uint8_t* tag, size_t tag_len);
+
+// EAX Mode
+// EAX 是一种认证加密模式，提供保密性和完整性。
+// iv: Nonce (任意长度)
+// iv_len: Nonce 长度
+// header: 附加认证数据 (AAD)
+// header_len: AAD 长度
+// input: 输入数据
+// output: 输出数据 (长度与 input 相同)
+// length: 数据长度
+// tag: 认证标签输出 (加密时) 或 输入 (解密时)
+// tag_len: 标签长度 (通常 16 字节)
+void AES_EAX_encrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* header, size_t header_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len);
+
+int AES_EAX_decrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* header, size_t header_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     const uint8_t* tag, size_t tag_len);
+
+
+

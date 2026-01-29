@@ -6,7 +6,7 @@
 /* 定义                                                       */
 /*****************************************************************************/
 
-// Nb 状态矩阵(State Matrix)的列数 AES的分组长度固定为 ​​128位​(16字节), 分组始终映射为4×4字节矩阵,​​ 所以 Nb 恒为 4​​
+// Nb 状态矩阵(State Matrix)的列数 AES的分组长度固定为 128位(16字节), 分组始终映射为4x4字节矩阵, 所以 Nb 恒为 4
 #define Nb 4
 
 // Nk 密钥的长度，单位为 32 bit
@@ -458,4 +458,782 @@ void AES_CTR_xcrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length)
 		buf[i] = (buf[i] ^ buffer[bi]);
 	}
 }
+
+// CFB (Cipher Feedback Mode)
+void AES_CFB_encrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length)
+{
+    size_t i;
+    uint8_t* Iv = ctx->Iv;
+    for (i = 0; i < length; i += AES_BLOCKLEN)
+    {
+        Cipher((state_t*)Iv, ctx->RoundKey);
+        XorWithIv(buf, Iv);
+        memcpy(Iv, buf, AES_BLOCKLEN);
+        buf += AES_BLOCKLEN;
+    }
+}
+
+void AES_CFB_decrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length)
+{
+    size_t i;
+    uint8_t storeNextIv[AES_BLOCKLEN];
+    uint8_t* Iv = ctx->Iv;
+    for (i = 0; i < length; i += AES_BLOCKLEN)
+    {
+        memcpy(storeNextIv, buf, AES_BLOCKLEN);
+        Cipher((state_t*)Iv, ctx->RoundKey);
+        XorWithIv(buf, Iv);
+        memcpy(Iv, storeNextIv, AES_BLOCKLEN);
+        buf += AES_BLOCKLEN;
+    }
+}
+
+// OFB (Output Feedback Mode)
+void AES_OFB_encrypt_buffer(AES_ctx* ctx, uint8_t* buf, size_t length)
+{
+    size_t i;
+    uint8_t* Iv = ctx->Iv;
+    for (i = 0; i < length; i += AES_BLOCKLEN)
+    {
+        Cipher((state_t*)Iv, ctx->RoundKey);
+        XorWithIv(buf, Iv);
+        buf += AES_BLOCKLEN;
+    }
+}
+
+// GCM 实现
+
+// GF(2^128) 乘法: r = x * y
+// 使用简单的 bitwise shift-and-xor 实现，避免大表，保持 compact。
+// 这里的 x, y, r 都是 16 字节大端序。
+static void gf128_mul(const uint8_t* x, const uint8_t* y, uint8_t* r)
+{
+    uint8_t v[16];
+    uint8_t z[16];
+    int i, j;
+    
+    // Z_0 = 0
+    memset(z, 0, 16);
+    // V_0 = Y
+    memcpy(v, y, 16);
+
+    for (i = 0; i < 16; ++i) {
+        for (j = 7; j >= 0; --j) {
+            // 如果 x 的第 i 字节的第 j 位是 1
+            if ((x[i] >> j) & 1) {
+                // Z = Z ^ V
+                int k;
+                for (k = 0; k < 16; ++k) z[k] ^= v[k];
+            }
+            // V = V >> 1 (GF(2^128) 域上)
+            // 如果 V 的最低位是 0，则 V = right_shift(V)
+            // 如果 V 的最低位是 1，则 V = right_shift(V) ^ R (R = 0xE1...00)
+            int lsb = v[15] & 1;
+            // Right shift V by 1 bit
+            int k;
+            uint8_t carry = 0;
+            for (k = 0; k < 16; ++k) {
+                uint8_t next_carry = v[k] & 1;
+                v[k] = (v[k] >> 1) | (carry << 7);
+                carry = next_carry;
+            }
+            if (lsb) {
+                // R = 11100001 || 0...0 (in big endian bits, usually represented as 0xE1000... in first byte)
+                // 但注意 GCM spec 中位顺序的定义。
+                // NIST SP 800-38D: R = 11100001 || 0^120.
+                // 对应第一个字节 0xE1.
+                v[0] ^= 0xE1;
+            }
+        }
+    }
+    memcpy(r, z, 16);
+}
+
+// GHASH(H, A, C) = X_{m+n+1}
+// 输入: H (subkey), aad, aad_len, ciphertext, cipher_len
+// 输出: result (16 bytes)
+static void ghash(const uint8_t* h, const uint8_t* aad, size_t aad_len,
+                  const uint8_t* cipher, size_t cipher_len, uint8_t* result)
+{
+    uint8_t y[16];
+    uint8_t len_block[16];
+    const uint8_t* p;
+    size_t left;
+
+    memset(y, 0, 16);
+
+    // 1. Process AAD
+    p = aad;
+    left = aad_len;
+    while (left >= 16) {
+        int k;
+        for (k = 0; k < 16; ++k) y[k] ^= p[k];
+        gf128_mul(y, h, y);
+        p += 16;
+        left -= 16;
+    }
+    if (left > 0) {
+        int k;
+        for (k = 0; k < left; ++k) y[k] ^= p[k];
+        gf128_mul(y, h, y);
+    }
+
+    // 2. Process Ciphertext
+    p = cipher;
+    left = cipher_len;
+    while (left >= 16) {
+        int k;
+        for (k = 0; k < 16; ++k) y[k] ^= p[k];
+        gf128_mul(y, h, y);
+        p += 16;
+        left -= 16;
+    }
+    if (left > 0) {
+        int k;
+        for (k = 0; k < left; ++k) y[k] ^= p[k];
+        gf128_mul(y, h, y);
+    }
+
+    // 3. Process Lengths (len(A) || len(C)) in bits (64 bits each)
+    // 注意: 大端序存储
+    memset(len_block, 0, 16);
+    // aad_len * 8
+    uint64_t alen_bits = (uint64_t)aad_len * 8;
+    uint64_t clen_bits = (uint64_t)cipher_len * 8;
+    
+    // Store big-endian
+    int k;
+    for(k=0; k<8; ++k) len_block[k] = (alen_bits >> (56 - 8*k)) & 0xFF;
+    for(k=0; k<8; ++k) len_block[8+k] = (clen_bits >> (56 - 8*k)) & 0xFF;
+
+    for (k = 0; k < 16; ++k) y[k] ^= len_block[k];
+    gf128_mul(y, h, y);
+
+    memcpy(result, y, 16);
+}
+
+// GCM Counter Increment (inc32)
+// 仅增加最后 4 字节
+static void gcm_inc32(uint8_t* block)
+{
+    uint32_t val;
+    // Load big-endian
+    val = (block[12] << 24) | (block[13] << 16) | (block[14] << 8) | block[15];
+    val++;
+    // Store big-endian
+    block[12] = (val >> 24) & 0xFF;
+    block[13] = (val >> 16) & 0xFF;
+    block[14] = (val >> 8) & 0xFF;
+    block[15] = val & 0xFF;
+}
+
+// GCTR(K, ICB, X)
+static void gctr(AES_ctx* ctx, const uint8_t* icb, const uint8_t* in, size_t len, uint8_t* out)
+{
+    uint8_t cb[16];
+    uint8_t buf[16];
+    size_t i;
+
+    if (len == 0) return;
+
+    memcpy(cb, icb, 16);
+    
+    size_t n_blocks = len / 16;
+    size_t tail = len % 16;
+
+    for (i = 0; i < n_blocks; ++i) {
+        // Encrypt CB to get keystream block
+        // 注意: Cipher 函数会修改 buf，所以先复制 CB
+        memcpy(buf, cb, 16);
+        Cipher((state_t*)buf, ctx->RoundKey); // E(K, CB)
+        
+        // XOR with input
+        int k;
+        for (k = 0; k < 16; ++k) out[i*16 + k] = in[i*16 + k] ^ buf[k];
+
+        // Increment CB
+        gcm_inc32(cb);
+    }
+
+    if (tail > 0) {
+        memcpy(buf, cb, 16);
+        Cipher((state_t*)buf, ctx->RoundKey);
+        int k;
+        for (k = 0; k < tail; ++k) out[n_blocks*16 + k] = in[n_blocks*16 + k] ^ buf[k];
+    }
+}
+
+void AES_GCM_encrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len)
+{
+    uint8_t h[16];
+    uint8_t j0[16];
+    uint8_t s[16];
+    uint8_t zero[16] = {0};
+
+    // 1. Calculate H = E(K, 0^128)
+    memcpy(h, zero, 16);
+    Cipher((state_t*)h, ctx->RoundKey);
+
+    // 2. Calculate J0
+    if (iv_len == 12) {
+        memcpy(j0, iv, 12);
+        j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
+    } else {
+        // GHASH(H, {}, IV)
+        // Pad IV to 128-bit boundary, then len(IV)
+        // 这里我们可以复用 ghash 函数，将 IV 当作 Ciphertext 部分传入 (AAD 为空)
+        // GHASH(H, AAD, C) 计算的是 AAD || Pad || C || Pad || len(A) || len(C)
+        // 但对于 J0 的计算，spec 是 GHASH_H(IV || 0... || len(IV)_64)
+        // 这实际上等同于调用 ghash(h, NULL, 0, iv, iv_len, j0)
+        ghash(h, NULL, 0, iv, iv_len, j0);
+    }
+
+    // 3. GCTR Encryption: C = GCTR(K, inc32(J0), P)
+    // First increment J0 to get the initial counter for data
+    uint8_t j1[16];
+    memcpy(j1, j0, 16);
+    gcm_inc32(j1);
+    
+    gctr(ctx, j1, input, length, output);
+
+    // 4. Calculate S = GHASH(H, AAD, C)
+    ghash(h, aad, aad_len, output, length, s);
+
+    // 5. Generate Tag: T = MSB_t(GCTR(K, J0, S))
+    // GCTR(K, J0, S) = S XOR E(K, J0)
+    // 先计算 E(K, J0)
+    uint8_t e_j0[16];
+    memcpy(e_j0, j0, 16);
+    Cipher((state_t*)e_j0, ctx->RoundKey);
+    
+    int k;
+    for (k = 0; k < tag_len && k < 16; ++k) {
+        tag[k] = s[k] ^ e_j0[k];
+    }
+}
+
+int AES_GCM_decrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     const uint8_t* tag, size_t tag_len)
+{
+    uint8_t h[16];
+    uint8_t j0[16];
+    uint8_t s[16];
+    uint8_t calc_tag[16];
+    uint8_t zero[16] = {0};
+
+    // 1. Calculate H
+    memcpy(h, zero, 16);
+    Cipher((state_t*)h, ctx->RoundKey);
+
+    // 2. Calculate J0
+    if (iv_len == 12) {
+        memcpy(j0, iv, 12);
+        j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
+    } else {
+        ghash(h, NULL, 0, iv, iv_len, j0);
+    }
+
+    // 3. Calculate S = GHASH(H, AAD, C) -> C is input here
+    // Calculate tag from Ciphertext BEFORE decrypting (crucial for in-place decryption)
+    ghash(h, aad, aad_len, input, length, s);
+
+    // 4. Calculate Tag
+    uint8_t e_j0[16];
+    memcpy(e_j0, j0, 16);
+    Cipher((state_t*)e_j0, ctx->RoundKey);
+
+    int k;
+    int diff = 0;
+    for (k = 0; k < tag_len && k < 16; ++k) {
+        calc_tag[k] = s[k] ^ e_j0[k];
+        diff |= (calc_tag[k] ^ tag[k]);
+    }
+
+    // If tag check fails, we should ideally not output plaintext.
+    // But for this API, we return status.
+    if (diff != 0) {
+        return 1;
+    }
+
+    // 5. GCTR Decryption: P = GCTR(K, inc32(J0), C)
+    uint8_t j1[16];
+    memcpy(j1, j0, 16);
+    gcm_inc32(j1);
+
+    gctr(ctx, j1, input, length, output);
+
+    return 0;
+}
+
+// CCM Implementation
+
+// Helper to format the first block B0 for CBC-MAC
+// Flags: Reserved(1) | Adata(1) | (t-2)/2 (3) | (q-1) (3)
+static void ccm_format_b0(uint8_t* b0, const uint8_t* nonce, size_t nonce_len, size_t adata_len, size_t payload_len, size_t tag_len)
+{
+    uint8_t q = 15 - (uint8_t)nonce_len; // q = 15 - n
+    uint8_t t = (uint8_t)tag_len;
+    uint8_t flags = 0;
+
+    // Adata present?
+    if (adata_len > 0) flags |= 0x40;
+    
+    // Encode t: (t-2)/2
+    flags |= ((t - 2) / 2) << 3;
+
+    // Encode q: (q-1)
+    flags |= (q - 1);
+
+    b0[0] = flags;
+
+    // Nonce
+    memcpy(b0 + 1, nonce, nonce_len);
+
+    // Q: Message length in big-endian, q bytes
+    size_t i;
+    for (i = 0; i < q; ++i) {
+        b0[15 - i] = (payload_len >> (8 * i)) & 0xFF;
+    }
+}
+
+// Helper to format the counter block Ctr0
+// Flags: Reserved(1) | Reserved(1) | 0(3) | (q-1) (3)
+static void ccm_format_ctr0(uint8_t* ctr0, const uint8_t* nonce, size_t nonce_len)
+{
+    uint8_t q = 15 - (uint8_t)nonce_len;
+    uint8_t flags = (q - 1);
+
+    ctr0[0] = flags;
+    memcpy(ctr0 + 1, nonce, nonce_len);
+    // Counter starts at 0 (for Ctr0) or 1 (for first block)
+    // Initialize rest to 0
+    size_t i;
+    for (i = 0; i < q; ++i) {
+        ctr0[15 - i] = 0;
+    }
+}
+
+static void ccm_inc_ctr(uint8_t* ctr, size_t q)
+{
+    size_t i;
+    for (i = 0; i < q; ++i) {
+        ctr[15 - i]++;
+        if (ctr[15 - i] != 0) break;
+    }
+}
+
+void AES_CCM_encrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len)
+{
+    uint8_t b[16];
+    uint8_t y[16] = {0};
+    uint8_t ctr[16];
+    uint8_t s0[16];
+    size_t i;
+
+    // 1. Calculate MAC (CBC-MAC)
+    // B0
+    memset(b, 0, 16);
+    ccm_format_b0(b, iv, iv_len, aad_len, length, tag_len);
+    
+    // Y0 = E(K, B0)
+    for (i = 0; i < 16; ++i) y[i] ^= b[i];
+    Cipher((state_t*)y, ctx->RoundKey);
+
+    // Process AAD
+    if (aad_len > 0) {
+        // ... (Header logic)
+        
+        // Re-implement AAD loop cleanly
+        size_t total_aad_bytes = (aad_len < 0xFF00) ? 2 + aad_len : 6 + aad_len;
+        size_t processed = 0;
+        
+        uint8_t header[6];
+        size_t header_len = 0;
+        if (aad_len < 0xFF00) {
+            header[0] = (aad_len >> 8) & 0xFF;
+            header[1] = aad_len & 0xFF;
+            header_len = 2;
+        } else {
+            header[0] = 0xFF; header[1] = 0xFE;
+            header[2] = (aad_len >> 24) & 0xFF; header[3] = (aad_len >> 16) & 0xFF;
+            header[4] = (aad_len >> 8) & 0xFF; header[5] = aad_len & 0xFF;
+            header_len = 6;
+        }
+
+        size_t h_idx = 0;
+        size_t a_idx = 0;
+        
+        while (processed < total_aad_bytes) {
+             for (i = 0; i < 16; ++i) {
+                 uint8_t byte = 0;
+                 if (h_idx < header_len) {
+                     byte = header[h_idx++];
+                 } else if (a_idx < aad_len) {
+                     byte = aad[a_idx++];
+                 }
+                 // padding is 0, implicit
+                 
+                 y[i] ^= byte;
+                 processed++;
+                 if (processed == total_aad_bytes) break;
+             }
+             Cipher((state_t*)y, ctx->RoundKey);
+             // if (processed == total_aad_bytes) break; // This break is not needed here as the while condition handles it, but we need to ensure we don't Cipher again if we finished exactly on block boundary?
+             // Actually, CBC-MAC processes full blocks.
+             // If we filled a partial block and finished (processed == total_aad_bytes), we just did Cipher() on the padded block. Correct.
+             // If we filled a full block and have more, we Cipher() and continue.
+             // If we filled a full block and finished, we Cipher() and stop.
+             // The loop structure:
+             // Fill buffer (Y ^= data)
+             // If buffer full or end of data: Cipher(Y)
+             
+             // The current logic:
+             // Inner loop xors up to 16 bytes.
+             // If we hit end of data inside inner loop, we break inner loop.
+             // Then we Cipher(Y). This is correct for the last partial block (padded with 0s because we didn't touch y[i] for i > end).
+             // BUT, if we finished exactly at 16 bytes, we Cipher(Y) and then outer loop terminates. Correct.
+        }
+    }
+
+    // Process Payload (Plaintext) for MAC
+    size_t p_idx = 0;
+    while (p_idx < length) {
+        for (i = 0; i < 16; ++i) {
+            if (p_idx < length) {
+                y[i] ^= input[p_idx++];
+            } else {
+                y[i] ^= 0; // Padding
+            }
+        }
+        Cipher((state_t*)y, ctx->RoundKey);
+    }
+    
+    // Tag T = MSB_t(Y_m)
+    // But we need to XOR with S0 = E(K, Ctr0)
+    
+    // 2. Generate Key Stream and Encrypt
+    // Ctr0
+    ccm_format_ctr0(ctr, iv, iv_len);
+    
+    // S0 = E(K, Ctr0)
+    memcpy(s0, ctr, 16);
+    Cipher((state_t*)s0, ctx->RoundKey);
+    
+    // Encrypt Payload: CTR mode starting with Ctr1
+    uint8_t q = 15 - (uint8_t)iv_len;
+    uint8_t keystream[16];
+    
+    p_idx = 0;
+    while (p_idx < length) {
+        ccm_inc_ctr(ctr, q); // Ctr++
+        memcpy(keystream, ctr, 16);
+        Cipher((state_t*)keystream, ctx->RoundKey);
+        
+        for (i = 0; i < 16 && p_idx < length; ++i) {
+            output[p_idx] = input[p_idx] ^ keystream[i];
+            p_idx++;
+        }
+    }
+
+    // 3. Finalize Tag
+    for (i = 0; i < tag_len; ++i) {
+        tag[i] = y[i] ^ s0[i];
+    }
+}
+
+int AES_CCM_decrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     const uint8_t* tag, size_t tag_len)
+{
+    uint8_t ctr[16];
+    uint8_t s0[16];
+    uint8_t y[16] = {0};
+    uint8_t b[16];
+    size_t i;
+
+    // 1. Decrypt Payload first (CTR mode)
+    ccm_format_ctr0(ctr, iv, iv_len);
+    
+    // S0
+    memcpy(s0, ctr, 16);
+    Cipher((state_t*)s0, ctx->RoundKey);
+    
+    uint8_t q = 15 - (uint8_t)iv_len;
+    uint8_t keystream[16];
+    size_t p_idx = 0;
+    
+    while (p_idx < length) {
+        ccm_inc_ctr(ctr, q);
+        memcpy(keystream, ctr, 16);
+        Cipher((state_t*)keystream, ctx->RoundKey);
+        
+        for (i = 0; i < 16 && p_idx < length; ++i) {
+            output[p_idx] = input[p_idx] ^ keystream[i];
+            p_idx++;
+        }
+    }
+
+    // 2. Re-calculate MAC from Decrypted Payload (output) + AAD
+    // B0
+    memset(b, 0, 16);
+    ccm_format_b0(b, iv, iv_len, aad_len, length, tag_len);
+    
+    for (i = 0; i < 16; ++i) y[i] ^= b[i];
+    Cipher((state_t*)y, ctx->RoundKey);
+
+    // Process AAD
+    if (aad_len > 0) {
+        size_t total_aad_bytes = (aad_len < 0xFF00) ? 2 + aad_len : 6 + aad_len;
+        size_t processed = 0;
+        
+        uint8_t header[6];
+        size_t header_len = 0;
+        if (aad_len < 0xFF00) {
+            header[0] = (aad_len >> 8) & 0xFF;
+            header[1] = aad_len & 0xFF;
+            header_len = 2;
+        } else {
+            header[0] = 0xFF; header[1] = 0xFE;
+            header[2] = (aad_len >> 24) & 0xFF; header[3] = (aad_len >> 16) & 0xFF;
+            header[4] = (aad_len >> 8) & 0xFF; header[5] = aad_len & 0xFF;
+            header_len = 6;
+        }
+
+        size_t h_idx = 0;
+        size_t a_idx = 0;
+        
+        while (processed < total_aad_bytes) {
+             for (i = 0; i < 16; ++i) {
+                 uint8_t byte = 0;
+                 if (h_idx < header_len) {
+                     byte = header[h_idx++];
+                 } else if (a_idx < aad_len) {
+                     byte = aad[a_idx++];
+                 }
+                 y[i] ^= byte;
+                 processed++;
+                 if (processed == total_aad_bytes) break;
+             }
+             Cipher((state_t*)y, ctx->RoundKey);
+             if (processed == total_aad_bytes) break;
+        }
+    }
+
+    // Process Payload (Plaintext - which is now in 'output')
+    p_idx = 0;
+    while (p_idx < length) {
+        for (i = 0; i < 16; ++i) {
+            if (p_idx < length) {
+                y[i] ^= output[p_idx++];
+            } else {
+                y[i] ^= 0;
+            }
+        }
+        Cipher((state_t*)y, ctx->RoundKey);
+    }
+
+    // 3. Verify Tag
+    uint8_t calc_tag[16];
+    for (i = 0; i < tag_len; ++i) {
+        calc_tag[i] = y[i] ^ s0[i];
+    }
+    
+    // Compare
+    int diff = 0;
+    for (i = 0; i < tag_len; ++i) {
+        diff |= (calc_tag[i] ^ tag[i]);
+    }
+
+    return (diff == 0) ? 0 : 1;
+}
+
+// EAX Implementation
+
+static void gf128_double(uint8_t* in, uint8_t* out)
+{
+    int i;
+    uint8_t msb = in[0] & 0x80;
+    
+    // Shift left
+    for (i = 0; i < 15; ++i) {
+        out[i] = (in[i] << 1) | ((in[i+1] >> 7) & 1);
+    }
+    out[15] = (in[15] << 1);
+    
+    if (msb) {
+        out[15] ^= 0x87;
+    }
+}
+
+static void cmac_generate_subkeys(AES_ctx* ctx, uint8_t* k1, uint8_t* k2)
+{
+    uint8_t L[16] = {0};
+    
+    // L = E(K, 0)
+    Cipher((state_t*)L, ctx->RoundKey);
+    
+    // K1 = 2 * L
+    gf128_double(L, k1);
+    
+    // K2 = 2 * K1
+    gf128_double(k1, k2);
+}
+
+static void cmac_compute(AES_ctx* ctx, const uint8_t* k1, const uint8_t* k2, 
+                         uint8_t tweak, const uint8_t* input, size_t length, uint8_t* out)
+{
+    uint8_t y[16] = {0};
+    uint8_t block[16];
+    size_t i;
+    
+    // Process tweak block [t]_n
+    // [t]_n = 0...0 || t (16 bytes)
+    memset(block, 0, 16);
+    block[15] = tweak;
+    
+    // Y = E(K, block)
+    memcpy(y, block, 16);
+    Cipher((state_t*)y, ctx->RoundKey);
+    
+    // Process input
+    const uint8_t* p = input;
+    size_t left = length;
+    
+    if (length == 0) {
+        // Empty message: 10^128 ^ K2
+        memset(block, 0, 16);
+        block[0] = 0x80;
+        for(i=0; i<16; ++i) block[i] ^= k2[i];
+        for(i=0; i<16; ++i) y[i] ^= block[i];
+        Cipher((state_t*)y, ctx->RoundKey);
+    } else {
+        while (left > 16) {
+            for(i=0; i<16; ++i) y[i] ^= p[i];
+            Cipher((state_t*)y, ctx->RoundKey);
+            p += 16;
+            left -= 16;
+        }
+        
+        memset(block, 0, 16);
+        memcpy(block, p, left);
+        
+        if (left == 16) {
+            // Full block ^ K1
+            for(i=0; i<16; ++i) block[i] ^= k1[i];
+        } else {
+            // Partial block + Padding ^ K2
+            block[left] = 0x80;
+            for(i=0; i<16; ++i) block[i] ^= k2[i];
+        }
+        
+        for(i=0; i<16; ++i) y[i] ^= block[i];
+        Cipher((state_t*)y, ctx->RoundKey);
+    }
+    
+    memcpy(out, y, 16);
+}
+
+void AES_EAX_encrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* header, size_t header_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len)
+{
+    uint8_t k1[16], k2[16];
+    uint8_t n_tag[16], h_tag[16], c_tag[16];
+    uint8_t full_tag[16];
+    int i;
+
+    // 1. Generate CMAC Subkeys
+    cmac_generate_subkeys(ctx, k1, k2);
+
+    // 2. N_tag = CMAC(0, Nonce)
+    cmac_compute(ctx, k1, k2, 0, iv, iv_len, n_tag);
+
+    // 3. H_tag = CMAC(1, Header)
+    cmac_compute(ctx, k1, k2, 1, header, header_len, h_tag);
+
+    // 4. CTR Encryption
+    // Use N_tag as IV for CTR
+    AES_ctx_set_iv(ctx, n_tag);
+    
+    // CTR encrypt input -> output
+    // Note: input and output can overlap if handled carefully, 
+    // but AES_CTR_xcrypt_buffer works in-place if buf is provided.
+    // Here we have input and output separate.
+    // Copy input to output then encrypt in-place.
+    memcpy(output, input, length);
+    AES_CTR_xcrypt_buffer(ctx, output, length);
+
+    // 5. C_tag = CMAC(2, Ciphertext)
+    cmac_compute(ctx, k1, k2, 2, output, length, c_tag);
+
+    // 6. Tag = N_tag ^ H_tag ^ C_tag
+    for (i = 0; i < 16; ++i) {
+        full_tag[i] = n_tag[i] ^ h_tag[i] ^ c_tag[i];
+    }
+
+    // Output tag
+    memcpy(tag, full_tag, tag_len < 16 ? tag_len : 16);
+}
+
+int AES_EAX_decrypt(AES_ctx* ctx, 
+                     const uint8_t* iv, size_t iv_len,
+                     const uint8_t* header, size_t header_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     const uint8_t* tag, size_t tag_len)
+{
+    uint8_t k1[16], k2[16];
+    uint8_t n_tag[16], h_tag[16], c_tag[16];
+    uint8_t full_tag[16];
+    int i;
+
+    // 1. Generate Subkeys
+    cmac_generate_subkeys(ctx, k1, k2);
+
+    // 2. N_tag = CMAC(0, Nonce)
+    cmac_compute(ctx, k1, k2, 0, iv, iv_len, n_tag);
+
+    // 3. H_tag = CMAC(1, Header)
+    cmac_compute(ctx, k1, k2, 1, header, header_len, h_tag);
+
+    // 4. C_tag = CMAC(2, Ciphertext)
+    // Input is Ciphertext
+    cmac_compute(ctx, k1, k2, 2, input, length, c_tag);
+
+    // 5. Calculate Tag
+    for (i = 0; i < 16; ++i) {
+        full_tag[i] = n_tag[i] ^ h_tag[i] ^ c_tag[i];
+    }
+
+    // 6. Verify Tag
+    int diff = 0;
+    for (i = 0; i < tag_len && i < 16; ++i) {
+        diff |= (tag[i] ^ full_tag[i]);
+    }
+
+    if (diff != 0) return 1; // Auth failed
+
+    // 7. Decrypt
+    // Use N_tag as IV
+    AES_ctx_set_iv(ctx, n_tag);
+    memcpy(output, input, length);
+    AES_CTR_xcrypt_buffer(ctx, output, length);
+
+    return 0;
+}
+
 
