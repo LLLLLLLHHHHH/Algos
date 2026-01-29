@@ -25,6 +25,22 @@ static void store32_le(uint8_t *dst, uint32_t val) {
     dst[3] = (uint8_t)(val >> 24);
 }
 
+static void chacha20_rounds(uint32_t x[16]) {
+    for (int i = 0; i < 10; i++) {
+        // Column rounds
+        QR(x[0], x[4], x[8],  x[12]);
+        QR(x[1], x[5], x[9],  x[13]);
+        QR(x[2], x[6], x[10], x[14]);
+        QR(x[3], x[7], x[11], x[15]);
+        
+        // Diagonal rounds
+        QR(x[0], x[5], x[10], x[15]);
+        QR(x[1], x[6], x[11], x[12]);
+        QR(x[2], x[7], x[8],  x[13]);
+        QR(x[3], x[4], x[9],  x[14]);
+    }
+}
+
 void chacha20_init(chacha20_context *ctx, const uint8_t key[32], const uint8_t nonce[12], uint32_t counter) {
     // Constants
     ctx->state[0] = load32_le((const uint8_t*)constant);
@@ -46,23 +62,58 @@ void chacha20_init(chacha20_context *ctx, const uint8_t key[32], const uint8_t n
     }
 }
 
+void hchacha20(const uint8_t key[32], const uint8_t nonce[16], uint8_t out_subkey[32]) {
+    uint32_t st[16];
+
+    // Constants
+    st[0] = load32_le((const uint8_t*)constant);
+    st[1] = load32_le((const uint8_t*)constant + 4);
+    st[2] = load32_le((const uint8_t*)constant + 8);
+    st[3] = load32_le((const uint8_t*)constant + 12);
+
+    // Key
+    for (int i = 0; i < 8; i++) {
+        st[4 + i] = load32_le(key + i * 4);
+    }
+
+    // 128-bit nonce occupies last 4 words (no counter)
+    for (int i = 0; i < 4; i++) {
+        st[12 + i] = load32_le(nonce + i * 4);
+    }
+
+    uint32_t x[16];
+    memcpy(x, st, 64);
+    chacha20_rounds(x);
+
+    // Output: first row and last row (words 0..3 and 12..15), little-endian bytes
+    for (int i = 0; i < 4; i++) {
+        store32_le(out_subkey + i * 4, x[i]);
+    }
+    for (int i = 0; i < 4; i++) {
+        store32_le(out_subkey + (4 + i) * 4, x[12 + i]);
+    }
+}
+
+void xchacha20_init(chacha20_context *ctx, const uint8_t key[32], const uint8_t nonce[24], uint32_t counter) {
+    uint8_t subkey[32];
+    uint8_t nonce12[12];
+
+    // subkey = HChaCha20(key, nonce[0..15])
+    hchacha20(key, nonce, subkey);
+
+    // nonce12 = 0x00000000 || nonce[16..23]
+    memset(nonce12, 0, 4);
+    memcpy(nonce12 + 4, nonce + 16, 8);
+
+    // Standard IETF ChaCha20 init with derived subkey + constructed nonce12
+    chacha20_init(ctx, subkey, nonce12, counter);
+}
+
 static void chacha20_block(chacha20_context *ctx, uint8_t output[64]) {
     uint32_t x[16];
     memcpy(x, ctx->state, 64);
 
-    for (int i = 0; i < 10; i++) {
-        // Column rounds
-        QR(x[0], x[4], x[8],  x[12]);
-        QR(x[1], x[5], x[9],  x[13]);
-        QR(x[2], x[6], x[10], x[14]);
-        QR(x[3], x[7], x[11], x[15]);
-        
-        // Diagonal rounds
-        QR(x[0], x[5], x[10], x[15]);
-        QR(x[1], x[6], x[11], x[12]);
-        QR(x[2], x[7], x[8],  x[13]);
-        QR(x[3], x[4], x[9],  x[14]);
-    }
+    chacha20_rounds(x);
 
     for (int i = 0; i < 16; i++) {
         x[i] += ctx->state[i];

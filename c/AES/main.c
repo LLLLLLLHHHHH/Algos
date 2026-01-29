@@ -313,6 +313,55 @@ static void test_eax() {
     }
 }
 
+static void test_ocb() {
+    // RFC 7253 Appendix A (AES-128, TAGLEN=128)
+    uint8_t key[16] = {
+        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+    };
+    AES_ctx ctx;
+    AES_init_ctx(&ctx, key);
+
+    printf("\nTesting OCB:\n");
+
+    // Vector #1: N=BBAA...1100, A=empty, P=empty, C is just Tag (16 bytes)
+    uint8_t nonce1[12] = { 0xbb,0xaa,0x99,0x88,0x77,0x66,0x55,0x44,0x33,0x22,0x11,0x00 };
+    uint8_t expected_tag1[16] = { 0x78,0x54,0x07,0xbf,0xff,0xc8,0xad,0x9e,0xdc,0xc5,0x52,0x0a,0xc9,0x11,0x1e,0xe6 };
+    uint8_t tag1[16];
+
+    AES_OCB_encrypt(&ctx, nonce1, 12, NULL, 0, NULL, NULL, 0, tag1, 16);
+    printf("OCB Tag(Empty): "); phex(tag1, 16);
+    if (memcmp(tag1, expected_tag1, 16) == 0) printf("OCB Vector#1 PASS\n");
+    else printf("OCB Vector#1 FAIL\n");
+
+    // Vector #2: N=BBAA...1101, A=0001020304050607, P=0001020304050607
+    uint8_t nonce2[12] = { 0xbb,0xaa,0x99,0x88,0x77,0x66,0x55,0x44,0x33,0x22,0x11,0x01 };
+    uint8_t aad2[8]   = { 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07 };
+    uint8_t plain2[8] = { 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07 };
+    uint8_t expected_cipher2[8] = { 0x68,0x20,0xb3,0x65,0x7b,0x6f,0x61,0x5a };
+    uint8_t expected_tag2[16] = { 0x57,0x25,0xbd,0xa0,0xd3,0xb4,0xeb,0x3a,0x25,0x7c,0x9a,0xf1,0xf8,0xf0,0x30,0x09 };
+
+    uint8_t cipher2[8];
+    uint8_t tag2[16];
+
+    AES_OCB_encrypt(&ctx, nonce2, 12, aad2, 8, plain2, cipher2, 8, tag2, 16);
+    printf("Plain: "); phex(plain2, 8);
+    printf("Enc:   "); phex(cipher2, 8);
+    printf("Tag:   "); phex(tag2, 16);
+
+    if (memcmp(cipher2, expected_cipher2, 8) == 0 && memcmp(tag2, expected_tag2, 16) == 0) {
+        printf("OCB Vector#2 Encrypt PASS\n");
+    } else {
+        printf("OCB Vector#2 Encrypt FAIL\n");
+    }
+
+    // Decrypt + verify
+    uint8_t dec2[8];
+    int r = AES_OCB_decrypt(&ctx, nonce2, 12, aad2, 8, cipher2, dec2, 8, tag2, 16);
+    printf("Dec:   "); phex(dec2, 8);
+    if (r == 0 && memcmp(dec2, plain2, 8) == 0) printf("OCB Vector#2 Decrypt PASS\n");
+    else printf("OCB Vector#2 Decrypt FAIL (ret=%d)\n", r);
+}
+
 int main()
 {
     test_ecb();
@@ -323,6 +372,7 @@ int main()
     test_gcm();
     test_ccm();
     test_eax();
+    test_ocb();
     return 0;
 }
 

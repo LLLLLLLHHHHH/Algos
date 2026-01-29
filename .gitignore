@@ -9,6 +9,9 @@
 *.ilk
 *.exp
 
+# Executables without extension in C directories
+c/**/main
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

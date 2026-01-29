@@ -440,6 +440,640 @@ function AES_OFB_encrypt_buffer(ctx, buf, length) {
 // OFB Decryption is same as Encryption
 const AES_OFB_decrypt_buffer = AES_OFB_encrypt_buffer;
 
+// -----------------------------------------------------------------------------
+// AEAD modes (GCM / CCM / EAX / OCB) - ported from c/AES/AES.c
+// -----------------------------------------------------------------------------
+
+function aesEncryptBlock(ctx, inBlock16) {
+    const block = new Uint8Array(inBlock16); // copy
+    const state = bufToState(block, 0);
+    Cipher(state, ctx.RoundKey);
+    stateToBuf(state, block, 0);
+    return block;
+}
+
+function aesDecryptBlock(ctx, inBlock16) {
+    const block = new Uint8Array(inBlock16); // copy
+    const state = bufToState(block, 0);
+    InvCipher(state, ctx.RoundKey);
+    stateToBuf(state, block, 0);
+    return block;
+}
+
+function xorBlockInPlace(a16, b16) {
+    for (let i = 0; i < 16; ++i) a16[i] ^= b16[i];
+}
+
+function xorBlock(a16, b16) {
+    const out = new Uint8Array(16);
+    for (let i = 0; i < 16; ++i) out[i] = a16[i] ^ b16[i];
+    return out;
+}
+
+function ctMemcmp(a, b, n) {
+    let diff = 0;
+    for (let i = 0; i < n; ++i) diff |= (a[i] ^ b[i]);
+    return diff;
+}
+
+// ---- GCM ----
+
+function gf128Mul(x16, y16) {
+    // RFC: x,y are 16 bytes big-endian bits; shift-and-xor method (as C version)
+    const v = new Uint8Array(y16);
+    const z = new Uint8Array(16);
+
+    for (let i = 0; i < 16; ++i) {
+        for (let j = 7; j >= 0; --j) {
+            if (((x16[i] >> j) & 1) === 1) {
+                for (let k = 0; k < 16; ++k) z[k] ^= v[k];
+            }
+
+            const lsb = v[15] & 1;
+            // right shift v by 1 bit
+            let carry = 0;
+            for (let k = 0; k < 16; ++k) {
+                const nextCarry = v[k] & 1;
+                v[k] = ((v[k] >> 1) | (carry << 7)) & 0xFF;
+                carry = nextCarry;
+            }
+            if (lsb) v[0] ^= 0xE1;
+        }
+    }
+    return z;
+}
+
+function ghash(h16, aad, aadLen, cipher, cipherLen) {
+    const y = new Uint8Array(16);
+
+    function process(buf, len) {
+        if (!buf || len === 0) return;
+        let off = 0;
+        while (len >= 16) {
+            for (let k = 0; k < 16; ++k) y[k] ^= buf[off + k];
+            const yy = gf128Mul(y, h16);
+            y.set(yy);
+            off += 16;
+            len -= 16;
+        }
+        if (len > 0) {
+            for (let k = 0; k < len; ++k) y[k] ^= buf[off + k];
+            const yy = gf128Mul(y, h16);
+            y.set(yy);
+        }
+    }
+
+    process(aad, aadLen);
+    process(cipher, cipherLen);
+
+    // len block: [len(A)]_64 || [len(C)]_64 in bits, big-endian
+    const lenBlock = new Uint8Array(16);
+    const alenBits = BigInt(aadLen) * 8n;
+    const clenBits = BigInt(cipherLen) * 8n;
+    for (let k = 0; k < 8; ++k) lenBlock[k] = Number((alenBits >> BigInt(56 - 8 * k)) & 0xFFn);
+    for (let k = 0; k < 8; ++k) lenBlock[8 + k] = Number((clenBits >> BigInt(56 - 8 * k)) & 0xFFn);
+
+    for (let k = 0; k < 16; ++k) y[k] ^= lenBlock[k];
+    const yy = gf128Mul(y, h16);
+    y.set(yy);
+    return y;
+}
+
+function gcmInc32(block16) {
+    let val = ((block16[12] << 24) | (block16[13] << 16) | (block16[14] << 8) | block16[15]) >>> 0;
+    val = (val + 1) >>> 0;
+    block16[12] = (val >>> 24) & 0xFF;
+    block16[13] = (val >>> 16) & 0xFF;
+    block16[14] = (val >>> 8) & 0xFF;
+    block16[15] = val & 0xFF;
+}
+
+function gctr(ctx, icb16, input, len, output) {
+    if (len === 0) return;
+    const cb = new Uint8Array(icb16);
+    let off = 0;
+    while (len >= 16) {
+        const ks = aesEncryptBlock(ctx, cb);
+        for (let k = 0; k < 16; ++k) output[off + k] = input[off + k] ^ ks[k];
+        gcmInc32(cb);
+        off += 16;
+        len -= 16;
+    }
+    if (len > 0) {
+        const ks = aesEncryptBlock(ctx, cb);
+        for (let k = 0; k < len; ++k) output[off + k] = input[off + k] ^ ks[k];
+    }
+}
+
+function AES_GCM_encrypt(ctx, iv, ivLen, aad, aadLen, input, output, length, tag, tagLen) {
+    const zero = new Uint8Array(16);
+    const h = aesEncryptBlock(ctx, zero);
+
+    let j0;
+    if (ivLen === 12) {
+        j0 = new Uint8Array(16);
+        j0.set(iv.subarray(0, 12), 0);
+        j0[15] = 1;
+    } else {
+        j0 = ghash(h, null, 0, iv, ivLen);
+    }
+
+    const j1 = new Uint8Array(j0);
+    gcmInc32(j1);
+    gctr(ctx, j1, input, length, output);
+
+    const s = ghash(h, aad, aadLen, output, length);
+    const eJ0 = aesEncryptBlock(ctx, j0);
+    const fullTag = new Uint8Array(16);
+    for (let i = 0; i < 16; ++i) fullTag[i] = s[i] ^ eJ0[i];
+    tag.set(fullTag.subarray(0, Math.min(tagLen, 16)));
+}
+
+function AES_GCM_decrypt(ctx, iv, ivLen, aad, aadLen, input, output, length, tag, tagLen) {
+    const zero = new Uint8Array(16);
+    const h = aesEncryptBlock(ctx, zero);
+
+    let j0;
+    if (ivLen === 12) {
+        j0 = new Uint8Array(16);
+        j0.set(iv.subarray(0, 12), 0);
+        j0[15] = 1;
+    } else {
+        j0 = ghash(h, null, 0, iv, ivLen);
+    }
+
+    const s = ghash(h, aad, aadLen, input, length);
+    const eJ0 = aesEncryptBlock(ctx, j0);
+    const fullTag = new Uint8Array(16);
+    for (let i = 0; i < 16; ++i) fullTag[i] = s[i] ^ eJ0[i];
+    if (ctMemcmp(fullTag, tag, Math.min(tagLen, 16)) !== 0) return 1;
+
+    const j1 = new Uint8Array(j0);
+    gcmInc32(j1);
+    gctr(ctx, j1, input, length, output);
+    return 0;
+}
+
+// ---- CCM ----
+
+function ccmFormatB0(b0, nonce, nonceLen, aadLen, payloadLen, tagLen) {
+    const q = 15 - nonceLen; // q = 15 - n
+    let flags = 0;
+    if (aadLen > 0) flags |= 0x40;
+    flags |= (((tagLen - 2) / 2) & 0x07) << 3;
+    flags |= (q - 1) & 0x07;
+    b0[0] = flags & 0xFF;
+    b0.set(nonce.subarray(0, nonceLen), 1);
+
+    let plen = BigInt(payloadLen);
+    for (let i = 0; i < q; ++i) {
+        b0[15 - i] = Number((plen >> BigInt(8 * i)) & 0xFFn);
+    }
+}
+
+function ccmFormatCtr0(ctr0, nonce, nonceLen) {
+    const q = 15 - nonceLen;
+    ctr0[0] = (q - 1) & 0xFF;
+    ctr0.set(nonce.subarray(0, nonceLen), 1);
+    for (let i = 0; i < q; ++i) ctr0[15 - i] = 0;
+}
+
+function ccmIncCtr(ctr, q) {
+    for (let i = 0; i < q; ++i) {
+        const idx = 15 - i;
+        ctr[idx] = (ctr[idx] + 1) & 0xFF;
+        if (ctr[idx] !== 0) break;
+    }
+}
+
+function AES_CCM_encrypt(ctx, nonce, nonceLen, aad, aadLen, input, output, length, tag, tagLen) {
+    const y = new Uint8Array(16);
+    const b0 = new Uint8Array(16);
+    ccmFormatB0(b0, nonce, nonceLen, aadLen, length, tagLen);
+
+    xorBlockInPlace(y, b0);
+    y.set(aesEncryptBlock(ctx, y));
+
+    // AAD encoding
+    if (aadLen > 0) {
+        const header = new Uint8Array(6);
+        let headerLen = 0;
+        if (aadLen < 0xFF00) {
+            header[0] = (aadLen >>> 8) & 0xFF;
+            header[1] = aadLen & 0xFF;
+            headerLen = 2;
+        } else {
+            header[0] = 0xFF; header[1] = 0xFE;
+            header[2] = (aadLen >>> 24) & 0xFF;
+            header[3] = (aadLen >>> 16) & 0xFF;
+            header[4] = (aadLen >>> 8) & 0xFF;
+            header[5] = aadLen & 0xFF;
+            headerLen = 6;
+        }
+
+        const total = (aadLen < 0xFF00) ? (2 + aadLen) : (6 + aadLen);
+        let processed = 0;
+        let hIdx = 0;
+        let aIdx = 0;
+        while (processed < total) {
+            for (let i = 0; i < 16; ++i) {
+                let byte = 0;
+                if (hIdx < headerLen) byte = header[hIdx++];
+                else if (aIdx < aadLen) byte = aad[aIdx++];
+                y[i] ^= byte;
+                processed++;
+                if (processed === total) break;
+            }
+            y.set(aesEncryptBlock(ctx, y));
+        }
+    }
+
+    // MAC plaintext
+    let pIdx = 0;
+    while (pIdx < length) {
+        for (let i = 0; i < 16; ++i) {
+            const byte = (pIdx < length) ? input[pIdx++] : 0;
+            y[i] ^= byte;
+        }
+        y.set(aesEncryptBlock(ctx, y));
+    }
+
+    // CTR encrypt
+    const ctr = new Uint8Array(16);
+    ccmFormatCtr0(ctr, nonce, nonceLen);
+    const s0 = aesEncryptBlock(ctx, ctr);
+    const q = 15 - nonceLen;
+
+    pIdx = 0;
+    while (pIdx < length) {
+        ccmIncCtr(ctr, q);
+        const ks = aesEncryptBlock(ctx, ctr);
+        for (let i = 0; i < 16 && pIdx < length; ++i) {
+            output[pIdx] = input[pIdx] ^ ks[i];
+            pIdx++;
+        }
+    }
+
+    const fullTag = new Uint8Array(16);
+    for (let i = 0; i < 16; ++i) fullTag[i] = y[i] ^ s0[i];
+    tag.set(fullTag.subarray(0, tagLen));
+}
+
+function AES_CCM_decrypt(ctx, nonce, nonceLen, aad, aadLen, input, output, length, tag, tagLen) {
+    // CTR decrypt first
+    const ctr = new Uint8Array(16);
+    ccmFormatCtr0(ctr, nonce, nonceLen);
+    const s0 = aesEncryptBlock(ctx, ctr);
+    const q = 15 - nonceLen;
+
+    let pIdx = 0;
+    while (pIdx < length) {
+        ccmIncCtr(ctr, q);
+        const ks = aesEncryptBlock(ctx, ctr);
+        for (let i = 0; i < 16 && pIdx < length; ++i) {
+            output[pIdx] = input[pIdx] ^ ks[i];
+            pIdx++;
+        }
+    }
+
+    // recompute MAC over AAD + plaintext
+    const y = new Uint8Array(16);
+    const b0 = new Uint8Array(16);
+    ccmFormatB0(b0, nonce, nonceLen, aadLen, length, tagLen);
+    xorBlockInPlace(y, b0);
+    y.set(aesEncryptBlock(ctx, y));
+
+    if (aadLen > 0) {
+        const header = new Uint8Array(6);
+        let headerLen = 0;
+        if (aadLen < 0xFF00) {
+            header[0] = (aadLen >>> 8) & 0xFF;
+            header[1] = aadLen & 0xFF;
+            headerLen = 2;
+        } else {
+            header[0] = 0xFF; header[1] = 0xFE;
+            header[2] = (aadLen >>> 24) & 0xFF;
+            header[3] = (aadLen >>> 16) & 0xFF;
+            header[4] = (aadLen >>> 8) & 0xFF;
+            header[5] = aadLen & 0xFF;
+            headerLen = 6;
+        }
+
+        const total = (aadLen < 0xFF00) ? (2 + aadLen) : (6 + aadLen);
+        let processed = 0;
+        let hIdx = 0;
+        let aIdx = 0;
+        while (processed < total) {
+            for (let i = 0; i < 16; ++i) {
+                let byte = 0;
+                if (hIdx < headerLen) byte = header[hIdx++];
+                else if (aIdx < aadLen) byte = aad[aIdx++];
+                y[i] ^= byte;
+                processed++;
+                if (processed === total) break;
+            }
+            y.set(aesEncryptBlock(ctx, y));
+        }
+    }
+
+    pIdx = 0;
+    while (pIdx < length) {
+        for (let i = 0; i < 16; ++i) {
+            const byte = (pIdx < length) ? output[pIdx++] : 0;
+            y[i] ^= byte;
+        }
+        y.set(aesEncryptBlock(ctx, y));
+    }
+
+    const calcTag = new Uint8Array(tagLen);
+    for (let i = 0; i < tagLen; ++i) calcTag[i] = y[i] ^ s0[i];
+    return (ctMemcmp(calcTag, tag, tagLen) === 0) ? 0 : 1;
+}
+
+// ---- EAX ----
+
+function gf128Double(in16) {
+    const out = new Uint8Array(16);
+    const msb = in16[0] & 0x80;
+    for (let i = 0; i < 15; ++i) out[i] = ((in16[i] << 1) | ((in16[i + 1] >> 7) & 1)) & 0xFF;
+    out[15] = (in16[15] << 1) & 0xFF;
+    if (msb) out[15] ^= 0x87;
+    return out;
+}
+
+function cmacGenerateSubkeys(ctx) {
+    const L = aesEncryptBlock(ctx, new Uint8Array(16));
+    const k1 = gf128Double(L);
+    const k2 = gf128Double(k1);
+    return { k1, k2 };
+}
+
+function cmacCompute(ctx, k1, k2, tweak, input, length) {
+    // As in C: Y initialized with E(K, [tweak])
+    const block = new Uint8Array(16);
+    block[15] = tweak & 0xFF;
+    let y = aesEncryptBlock(ctx, block);
+
+    if (length === 0) {
+        const last = new Uint8Array(16);
+        last[0] = 0x80;
+        xorBlockInPlace(last, k2);
+        xorBlockInPlace(y, last);
+        y = aesEncryptBlock(ctx, y);
+        return y;
+    }
+
+    let pOff = 0;
+    let left = length;
+    while (left > 16) {
+        for (let i = 0; i < 16; ++i) y[i] ^= input[pOff + i];
+        y = aesEncryptBlock(ctx, y);
+        pOff += 16;
+        left -= 16;
+    }
+
+    const last = new Uint8Array(16);
+    last.set(input.subarray(pOff, pOff + left), 0);
+    if (left === 16) {
+        xorBlockInPlace(last, k1);
+    } else {
+        last[left] = 0x80;
+        xorBlockInPlace(last, k2);
+    }
+    xorBlockInPlace(y, last);
+    y = aesEncryptBlock(ctx, y);
+    return y;
+}
+
+function AES_EAX_encrypt(ctx, iv, ivLen, header, headerLen, input, output, length, tag, tagLen) {
+    const { k1, k2 } = cmacGenerateSubkeys(ctx);
+    const nTag = cmacCompute(ctx, k1, k2, 0, iv, ivLen);
+    const hTag = cmacCompute(ctx, k1, k2, 1, header, headerLen);
+
+    // CTR encrypt with IV = nTag (preserve ctx.Iv)
+    const savedIv = new Uint8Array(ctx.Iv);
+    AES_ctx_set_iv(ctx, nTag);
+    output.set(input.subarray(0, length));
+    AES_CTR_xcrypt_buffer(ctx, output, length);
+    AES_ctx_set_iv(ctx, savedIv);
+
+    const cTag = cmacCompute(ctx, k1, k2, 2, output, length);
+    const fullTag = new Uint8Array(16);
+    for (let i = 0; i < 16; ++i) fullTag[i] = nTag[i] ^ hTag[i] ^ cTag[i];
+    tag.set(fullTag.subarray(0, Math.min(tagLen, 16)));
+}
+
+function AES_EAX_decrypt(ctx, iv, ivLen, header, headerLen, input, output, length, tag, tagLen) {
+    const { k1, k2 } = cmacGenerateSubkeys(ctx);
+    const nTag = cmacCompute(ctx, k1, k2, 0, iv, ivLen);
+    const hTag = cmacCompute(ctx, k1, k2, 1, header, headerLen);
+    const cTag = cmacCompute(ctx, k1, k2, 2, input, length);
+
+    const fullTag = new Uint8Array(16);
+    for (let i = 0; i < 16; ++i) fullTag[i] = nTag[i] ^ hTag[i] ^ cTag[i];
+    if (ctMemcmp(fullTag, tag, Math.min(tagLen, 16)) !== 0) return 1;
+
+    const savedIv = new Uint8Array(ctx.Iv);
+    AES_ctx_set_iv(ctx, nTag);
+    output.set(input.subarray(0, length));
+    AES_CTR_xcrypt_buffer(ctx, output, length);
+    AES_ctx_set_iv(ctx, savedIv);
+    return 0;
+}
+
+// ---- OCB (RFC 7253 / OCB3) ----
+
+function ntz(n) {
+    let x = n >>> 0;
+    let c = 0;
+    while ((x & 1) === 0) { c++; x >>>= 1; }
+    return c;
+}
+
+function ocbOffsetFromStretch(stretch24, bottom) {
+    const byteShift = (bottom / 8) | 0;
+    const bitShift = bottom % 8;
+    const out = new Uint8Array(16);
+    if (bitShift === 0) {
+        out.set(stretch24.subarray(byteShift, byteShift + 16));
+        return out;
+    }
+    for (let i = 0; i < 16; ++i) {
+        const a = stretch24[byteShift + i];
+        const b = stretch24[byteShift + i + 1];
+        out[i] = ((a << bitShift) | (b >>> (8 - bitShift))) & 0xFF;
+    }
+    return out;
+}
+
+function ocbBuildL(ctx) {
+    const Lstar = aesEncryptBlock(ctx, new Uint8Array(16));
+    const Ldollar = gf128Double(Lstar);
+    const Ltable = [gf128Double(Ldollar)]; // L_0
+    return { Lstar, Ldollar, Ltable };
+}
+
+function ocbGetL(Ltable, idx) {
+    while (Ltable.length <= idx) {
+        Ltable.push(gf128Double(Ltable[Ltable.length - 1]));
+    }
+    return Ltable[idx];
+}
+
+function ocbHash(ctx, aad, aadLen, Lstar, Ltable) {
+    const sum = new Uint8Array(16);
+    const offset = new Uint8Array(16);
+
+    const m = Math.floor(aadLen / 16);
+    const rem = aadLen % 16;
+
+    for (let i = 1; i <= m; ++i) {
+        xorBlockInPlace(offset, ocbGetL(Ltable, ntz(i)));
+        const block = xorBlock(aad.subarray((i - 1) * 16, i * 16), offset);
+        const enc = aesEncryptBlock(ctx, block);
+        xorBlockInPlace(sum, enc);
+    }
+
+    if (rem > 0) {
+        xorBlockInPlace(offset, Lstar);
+        const block = new Uint8Array(16);
+        block.set(aad.subarray(m * 16, m * 16 + rem), 0);
+        block[rem] = 0x80;
+        xorBlockInPlace(block, offset);
+        const enc = aesEncryptBlock(ctx, block);
+        xorBlockInPlace(sum, enc);
+    }
+    return sum;
+}
+
+function ocbFormatNonce(nonce, nonceLen, tagLen) {
+    // bytestring-only: nonceLen 1..15
+    const nb = new Uint8Array(16);
+    const tagBitsMod = ((tagLen * 8) % 128) & 0x7F;
+    nb[0] = ((tagBitsMod << 1) & 0xFE) & 0xFF;
+    nb.set(nonce.subarray(0, nonceLen), 16 - nonceLen);
+    nb[15 - nonceLen] |= 0x01; // separator bit
+    return nb;
+}
+
+function AES_OCB_encrypt(ctx, nonce, nonceLen, aad, aadLen, input, output, length, tag, tagLen) {
+    if (nonceLen < 1 || nonceLen > 15 || tagLen < 1 || tagLen > 16) {
+        if (tag) tag.fill(0);
+        if (output && input) output.set(input.subarray(0, length));
+        return;
+    }
+
+    const { Lstar, Ldollar, Ltable } = ocbBuildL(ctx);
+
+    const nb = ocbFormatNonce(nonce, nonceLen, tagLen);
+    const bottom = nb[15] & 0x3F;
+    const nbKtop = new Uint8Array(nb);
+    nbKtop[15] &= 0xC0;
+    const Ktop = aesEncryptBlock(ctx, nbKtop);
+
+    const stretch = new Uint8Array(24);
+    stretch.set(Ktop, 0);
+    for (let i = 0; i < 8; ++i) stretch[16 + i] = Ktop[i] ^ Ktop[i + 1];
+
+    let offset = ocbOffsetFromStretch(stretch, bottom);
+    const checksum = new Uint8Array(16);
+
+    const m = Math.floor(length / 16);
+    const rem = length % 16;
+
+    for (let i = 1; i <= m; ++i) {
+        xorBlockInPlace(offset, ocbGetL(Ltable, ntz(i)));
+        const P = input.subarray((i - 1) * 16, i * 16);
+        const tmp = xorBlock(P, offset);
+        const enc = aesEncryptBlock(ctx, tmp);
+        const C = xorBlock(enc, offset);
+        output.set(C, (i - 1) * 16);
+        xorBlockInPlace(checksum, P);
+    }
+
+    let tagFull;
+    if (rem > 0) {
+        xorBlockInPlace(offset, Lstar);
+        const pad = aesEncryptBlock(ctx, offset);
+        for (let i = 0; i < rem; ++i) output[m * 16 + i] = input[m * 16 + i] ^ pad[i];
+
+        const tmp = new Uint8Array(16);
+        tmp.set(input.subarray(m * 16, m * 16 + rem), 0);
+        tmp[rem] = 0x80;
+        xorBlockInPlace(checksum, tmp);
+
+        let t = xorBlock(checksum, offset);
+        xorBlockInPlace(t, Ldollar);
+        tagFull = aesEncryptBlock(ctx, t);
+    } else {
+        let t = xorBlock(checksum, offset);
+        xorBlockInPlace(t, Ldollar);
+        tagFull = aesEncryptBlock(ctx, t);
+    }
+
+    const hash = ocbHash(ctx, aad, aadLen, Lstar, Ltable);
+    xorBlockInPlace(tagFull, hash);
+    tag.set(tagFull.subarray(0, tagLen));
+}
+
+function AES_OCB_decrypt(ctx, nonce, nonceLen, aad, aadLen, input, output, length, tag, tagLen) {
+    if (nonceLen < 1 || nonceLen > 15 || tagLen < 1 || tagLen > 16) return 1;
+
+    const { Lstar, Ldollar, Ltable } = ocbBuildL(ctx);
+
+    const nb = ocbFormatNonce(nonce, nonceLen, tagLen);
+    const bottom = nb[15] & 0x3F;
+    const nbKtop = new Uint8Array(nb);
+    nbKtop[15] &= 0xC0;
+    const Ktop = aesEncryptBlock(ctx, nbKtop);
+
+    const stretch = new Uint8Array(24);
+    stretch.set(Ktop, 0);
+    for (let i = 0; i < 8; ++i) stretch[16 + i] = Ktop[i] ^ Ktop[i + 1];
+
+    let offset = ocbOffsetFromStretch(stretch, bottom);
+    const checksum = new Uint8Array(16);
+
+    const m = Math.floor(length / 16);
+    const rem = length % 16;
+
+    for (let i = 1; i <= m; ++i) {
+        xorBlockInPlace(offset, ocbGetL(Ltable, ntz(i)));
+        const C = input.subarray((i - 1) * 16, i * 16);
+        const tmp = xorBlock(C, offset);
+        const dec = aesDecryptBlock(ctx, tmp);
+        const P = xorBlock(dec, offset);
+        output.set(P, (i - 1) * 16);
+        xorBlockInPlace(checksum, P);
+    }
+
+    let tagFull;
+    if (rem > 0) {
+        xorBlockInPlace(offset, Lstar);
+        const pad = aesEncryptBlock(ctx, offset);
+        for (let i = 0; i < rem; ++i) output[m * 16 + i] = input[m * 16 + i] ^ pad[i];
+
+        const tmp = new Uint8Array(16);
+        tmp.set(output.subarray(m * 16, m * 16 + rem), 0);
+        tmp[rem] = 0x80;
+        xorBlockInPlace(checksum, tmp);
+
+        let t = xorBlock(checksum, offset);
+        xorBlockInPlace(t, Ldollar);
+        tagFull = aesEncryptBlock(ctx, t);
+    } else {
+        let t = xorBlock(checksum, offset);
+        xorBlockInPlace(t, Ldollar);
+        tagFull = aesEncryptBlock(ctx, t);
+    }
+
+    const hash = ocbHash(ctx, aad, aadLen, Lstar, Ltable);
+    xorBlockInPlace(tagFull, hash);
+
+    if (ctMemcmp(tagFull, tag, tagLen) !== 0) return 1;
+    return 0;
+}
+
 module.exports = {
     AES_ctx,
     AES_init_ctx,
@@ -453,5 +1087,14 @@ module.exports = {
     AES_CFB_encrypt_buffer,
     AES_CFB_decrypt_buffer,
     AES_OFB_encrypt_buffer,
-    AES_OFB_decrypt_buffer
+    AES_OFB_decrypt_buffer,
+
+    AES_GCM_encrypt,
+    AES_GCM_decrypt,
+    AES_CCM_encrypt,
+    AES_CCM_decrypt,
+    AES_EAX_encrypt,
+    AES_EAX_decrypt,
+    AES_OCB_encrypt,
+    AES_OCB_decrypt
 };

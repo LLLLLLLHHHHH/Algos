@@ -1237,3 +1237,354 @@ int AES_EAX_decrypt(AES_ctx* ctx,
 }
 
 
+// -----------------------------------------------------------------------------
+// OCB (RFC 7253 / OCB3) Implementation (bytestring-oriented)
+// -----------------------------------------------------------------------------
+
+static void aes_encrypt_block(const AES_ctx* ctx, const uint8_t in[16], uint8_t out[16])
+{
+    memcpy(out, in, 16);
+    Cipher((state_t*)out, ctx->RoundKey);
+}
+
+static void aes_decrypt_block(const AES_ctx* ctx, const uint8_t in[16], uint8_t out[16])
+{
+    memcpy(out, in, 16);
+    InvCipher((state_t*)out, ctx->RoundKey);
+}
+
+static void xor_block(uint8_t out[16], const uint8_t a[16], const uint8_t b[16])
+{
+    int i;
+    for (i = 0; i < 16; ++i) out[i] = a[i] ^ b[i];
+}
+
+static void xor_block_inplace(uint8_t a[16], const uint8_t b[16])
+{
+    int i;
+    for (i = 0; i < 16; ++i) a[i] ^= b[i];
+}
+
+static unsigned ntz_size_t(size_t x)
+{
+    // x is always >= 1 in OCB loops
+    unsigned n = 0;
+    while ((x & 1u) == 0u) {
+        n++;
+        x >>= 1;
+    }
+    return n;
+}
+
+// Extract Offset_0 = Stretch[1+bottom..128+bottom] for bottom in [0,63]
+// Stretch is 24 bytes: Ktop (16) || (Ktop[0..7] xor Ktop[1..8]) (8)
+static void ocb_offset_from_stretch(const uint8_t stretch[24], unsigned bottom, uint8_t offset0[16])
+{
+    unsigned byte_shift = bottom / 8;
+    unsigned bit_shift = bottom % 8;
+    unsigned i;
+
+    if (bit_shift == 0) {
+        for (i = 0; i < 16; ++i) offset0[i] = stretch[byte_shift + i];
+        return;
+    }
+
+    for (i = 0; i < 16; ++i) {
+        uint8_t a = stretch[byte_shift + i];
+        uint8_t b = stretch[byte_shift + i + 1];
+        offset0[i] = (uint8_t)((a << bit_shift) | (b >> (8 - bit_shift)));
+    }
+}
+
+// double() in GF(2^128) as defined by RFC 7253: shift-left, xor 0x87 if msb was set
+static void ocb_double_128(const uint8_t in[16], uint8_t out[16])
+{
+    gf128_double((uint8_t*)in, out);
+}
+
+static void ocb_build_L(const AES_ctx* ctx, uint8_t L_star[16], uint8_t L_dollar[16], uint8_t L_table[64][16], unsigned* L_max)
+{
+    uint8_t zero[16] = {0};
+
+    // L_* = ENCIPHER(K, 0^128)
+    aes_encrypt_block(ctx, zero, L_star);
+    // L_$ = double(L_*)
+    ocb_double_128(L_star, L_dollar);
+    // L_0 = double(L_$)
+    ocb_double_128(L_dollar, L_table[0]);
+    *L_max = 0;
+}
+
+static const uint8_t* ocb_get_L(uint8_t L_table[64][16], unsigned* L_max, unsigned idx)
+{
+    // idx is ntz(i), so bounded by log2(block_count). We cap at 63.
+    while (*L_max < idx) {
+        unsigned next = *L_max + 1;
+        if (next >= 64) break;
+        ocb_double_128(L_table[*L_max], L_table[next]);
+        *L_max = next;
+    }
+    return L_table[idx];
+}
+
+static void ocb_hash(const AES_ctx* ctx,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t L_star[16], uint8_t L_table[64][16], unsigned* L_max,
+                     uint8_t out_sum[16])
+{
+    uint8_t sum[16] = {0};
+    uint8_t offset[16] = {0};
+    uint8_t tmp[16];
+    uint8_t enc[16];
+
+    size_t m = aad_len / 16;
+    size_t rem = aad_len % 16;
+
+    size_t i;
+    for (i = 1; i <= m; ++i) {
+        const uint8_t* Li = ocb_get_L(L_table, L_max, ntz_size_t(i));
+        xor_block_inplace(offset, Li);
+
+        xor_block(tmp, aad + (i - 1) * 16, offset);
+        aes_encrypt_block(ctx, tmp, enc);
+        xor_block_inplace(sum, enc);
+    }
+
+    if (rem > 0) {
+        xor_block_inplace(offset, L_star);
+        memset(tmp, 0, 16);
+        memcpy(tmp, aad + m * 16, rem);
+        tmp[rem] = 0x80; // A_* || 1 || zeros(...)
+        xor_block_inplace(tmp, offset);
+        aes_encrypt_block(ctx, tmp, enc);
+        xor_block_inplace(sum, enc);
+    }
+
+    memcpy(out_sum, sum, 16);
+}
+
+static void ocb_format_nonce(uint8_t nonce_block[16], const uint8_t* nonce, size_t nonce_len, size_t tag_len)
+{
+    // Implements:
+    // Nonce = num2str(TAGLEN mod 128,7) || zeros(120-bitlen(N)) || 1 || N
+    // This implementation assumes N is a bytestring (nonce_len bytes), 1..15.
+    memset(nonce_block, 0, 16);
+
+    uint8_t tag_bits_mod_128 = (uint8_t)((tag_len * 8) % 128);
+    nonce_block[0] = (uint8_t)((tag_bits_mod_128 << 1) & 0xFE); // top 7 bits
+
+    // Place N at the end
+    if (nonce_len > 0) {
+        memcpy(nonce_block + (16 - nonce_len), nonce, nonce_len);
+    }
+
+    // Set the separator '1' bit immediately before N
+    // For bytestring N: bit position is 128 - 8*nonce_len, which is the LSB of byte (15 - nonce_len).
+    nonce_block[15 - nonce_len] |= 0x01;
+}
+
+static int ct_memcmp_n(const uint8_t* a, const uint8_t* b, size_t n)
+{
+    size_t i;
+    uint8_t diff = 0;
+    for (i = 0; i < n; ++i) diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff; // 0 if equal
+}
+
+void AES_OCB_encrypt(AES_ctx* ctx,
+                     const uint8_t* nonce, size_t nonce_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len)
+{
+    // Restrict to RFC5116-style bounds: nonce_len 1..15, tag_len 1..16
+    if (nonce_len < 1 || nonce_len > 15 || tag_len < 1 || tag_len > 16) {
+        // Invalid parameters; best-effort: zero outputs
+        if (tag && tag_len) memset(tag, 0, tag_len);
+        if (output && input && length) memcpy(output, input, length);
+        return;
+    }
+
+    uint8_t L_star[16], L_dollar[16];
+    uint8_t L_table[64][16];
+    unsigned L_max = 0;
+    ocb_build_L(ctx, L_star, L_dollar, L_table, &L_max);
+
+    // Nonce processing
+    uint8_t nb[16];
+    ocb_format_nonce(nb, nonce, nonce_len, tag_len);
+    unsigned bottom = (unsigned)(nb[15] & 0x3F);
+
+    uint8_t nb_ktop[16];
+    memcpy(nb_ktop, nb, 16);
+    nb_ktop[15] &= 0xC0; // zeros(6)
+
+    uint8_t Ktop[16];
+    aes_encrypt_block(ctx, nb_ktop, Ktop);
+
+    uint8_t stretch[24];
+    memcpy(stretch, Ktop, 16);
+    int i;
+    for (i = 0; i < 8; ++i) stretch[16 + i] = (uint8_t)(Ktop[i] ^ Ktop[i + 1]);
+
+    uint8_t offset[16];
+    ocb_offset_from_stretch(stretch, bottom, offset);
+
+    uint8_t checksum[16] = {0};
+
+    size_t m = length / 16;
+    size_t rem = length % 16;
+
+    uint8_t tmp[16];
+    uint8_t enc[16];
+
+    size_t blk;
+    for (blk = 1; blk <= m; ++blk) {
+        const uint8_t* Li = ocb_get_L(L_table, &L_max, ntz_size_t(blk));
+        xor_block_inplace(offset, Li);
+
+        const uint8_t* P = input + (blk - 1) * 16;
+        uint8_t* C = output + (blk - 1) * 16;
+
+        xor_block(tmp, P, offset);
+        aes_encrypt_block(ctx, tmp, enc);
+        xor_block(tmp, enc, offset); // tmp = C_i
+        memcpy(C, tmp, 16);
+
+        xor_block_inplace(checksum, P);
+    }
+
+    uint8_t tag_full[16];
+    uint8_t hash_sum[16];
+
+    if (rem > 0) {
+        // Offset_* = Offset_m xor L_*
+        xor_block_inplace(offset, L_star);
+
+        uint8_t pad[16];
+        aes_encrypt_block(ctx, offset, pad);
+
+        const uint8_t* Pstar = input + m * 16;
+        uint8_t* Cstar = output + m * 16;
+        for (i = 0; i < (int)rem; ++i) Cstar[i] = (uint8_t)(Pstar[i] ^ pad[i]);
+
+        // Checksum_* = Checksum_m xor (P_* || 1 || zeros(...))
+        memset(tmp, 0, 16);
+        memcpy(tmp, Pstar, rem);
+        tmp[rem] = 0x80;
+        xor_block_inplace(checksum, tmp);
+
+        // Tag = ENCIPHER(K, Checksum_* xor Offset_* xor L_$) xor HASH(K,A)
+        xor_block(tmp, checksum, offset);
+        xor_block_inplace(tmp, L_dollar);
+        aes_encrypt_block(ctx, tmp, tag_full);
+    } else {
+        // Tag = ENCIPHER(K, Checksum_m xor Offset_m xor L_$) xor HASH(K,A)
+        xor_block(tmp, checksum, offset);
+        xor_block_inplace(tmp, L_dollar);
+        aes_encrypt_block(ctx, tmp, tag_full);
+    }
+
+    ocb_hash(ctx, aad, aad_len, L_star, L_table, &L_max, hash_sum);
+    xor_block_inplace(tag_full, hash_sum);
+
+    memcpy(tag, tag_full, tag_len);
+}
+
+int AES_OCB_decrypt(AES_ctx* ctx,
+                    const uint8_t* nonce, size_t nonce_len,
+                    const uint8_t* aad, size_t aad_len,
+                    const uint8_t* input, uint8_t* output, size_t length,
+                    const uint8_t* tag, size_t tag_len)
+{
+    if (nonce_len < 1 || nonce_len > 15 || tag_len < 1 || tag_len > 16) {
+        return 1;
+    }
+
+    uint8_t L_star[16], L_dollar[16];
+    uint8_t L_table[64][16];
+    unsigned L_max = 0;
+    ocb_build_L(ctx, L_star, L_dollar, L_table, &L_max);
+
+    // Nonce processing
+    uint8_t nb[16];
+    ocb_format_nonce(nb, nonce, nonce_len, tag_len);
+    unsigned bottom = (unsigned)(nb[15] & 0x3F);
+
+    uint8_t nb_ktop[16];
+    memcpy(nb_ktop, nb, 16);
+    nb_ktop[15] &= 0xC0;
+
+    uint8_t Ktop[16];
+    aes_encrypt_block(ctx, nb_ktop, Ktop);
+
+    uint8_t stretch[24];
+    memcpy(stretch, Ktop, 16);
+    int i;
+    for (i = 0; i < 8; ++i) stretch[16 + i] = (uint8_t)(Ktop[i] ^ Ktop[i + 1]);
+
+    uint8_t offset[16];
+    ocb_offset_from_stretch(stretch, bottom, offset);
+
+    uint8_t checksum[16] = {0};
+
+    size_t m = length / 16;
+    size_t rem = length % 16;
+
+    uint8_t tmp[16];
+    uint8_t dec[16];
+
+    size_t blk;
+    for (blk = 1; blk <= m; ++blk) {
+        const uint8_t* Li = ocb_get_L(L_table, &L_max, ntz_size_t(blk));
+        xor_block_inplace(offset, Li);
+
+        const uint8_t* C = input + (blk - 1) * 16;
+        uint8_t* P = output + (blk - 1) * 16;
+
+        xor_block(tmp, C, offset);
+        aes_decrypt_block(ctx, tmp, dec);
+        xor_block(tmp, dec, offset); // tmp = P_i
+        memcpy(P, tmp, 16);
+
+        xor_block_inplace(checksum, tmp);
+    }
+
+    uint8_t tag_full[16];
+    uint8_t hash_sum[16];
+
+    if (rem > 0) {
+        xor_block_inplace(offset, L_star);
+
+        uint8_t pad[16];
+        aes_encrypt_block(ctx, offset, pad);
+
+        const uint8_t* Cstar = input + m * 16;
+        uint8_t* Pstar = output + m * 16;
+        for (i = 0; i < (int)rem; ++i) Pstar[i] = (uint8_t)(Cstar[i] ^ pad[i]);
+
+        memset(tmp, 0, 16);
+        memcpy(tmp, Pstar, rem);
+        tmp[rem] = 0x80;
+        xor_block_inplace(checksum, tmp);
+
+        xor_block(tmp, checksum, offset);
+        xor_block_inplace(tmp, L_dollar);
+        aes_encrypt_block(ctx, tmp, tag_full);
+    } else {
+        xor_block(tmp, checksum, offset);
+        xor_block_inplace(tmp, L_dollar);
+        aes_encrypt_block(ctx, tmp, tag_full);
+    }
+
+    ocb_hash(ctx, aad, aad_len, L_star, L_table, &L_max, hash_sum);
+    xor_block_inplace(tag_full, hash_sum);
+
+    // Verify tag (constant-time)
+    if (ct_memcmp_n(tag_full, tag, tag_len) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+

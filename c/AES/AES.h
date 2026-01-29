@@ -137,5 +137,29 @@ int AES_EAX_decrypt(AES_ctx* ctx,
                      const uint8_t* input, uint8_t* output, size_t length,
                      const uint8_t* tag, size_t tag_len);
 
+// OCB (Offset Codebook Mode, RFC 7253 / OCB3)
+// OCB 是一种认证加密模式（AEAD），提供保密性与完整性。
+// nonce: 需要保证在同一 key 下**绝不重复**（建议用计数器），长度 1..15 字节
+// nonce_len: nonce 长度（字节）
+// aad: 附加认证数据 (Additional Authenticated Data)，可以为 NULL
+// aad_len: aad 长度（字节）
+// input: 输入数据（明文/密文核心）
+// output: 输出数据（密文核心/明文），长度与 input 相同
+// length: 数据长度（字节）
+// tag: 认证标签输出 (加密时) 或 输入 (解密时)
+// tag_len: 标签长度（字节，1..16；常用 16）
+// 返回值: 解密成功返回 0，认证失败返回 1（仅解密时有效）
+void AES_OCB_encrypt(AES_ctx* ctx,
+                     const uint8_t* nonce, size_t nonce_len,
+                     const uint8_t* aad, size_t aad_len,
+                     const uint8_t* input, uint8_t* output, size_t length,
+                     uint8_t* tag, size_t tag_len);
+
+int AES_OCB_decrypt(AES_ctx* ctx,
+                    const uint8_t* nonce, size_t nonce_len,
+                    const uint8_t* aad, size_t aad_len,
+                    const uint8_t* input, uint8_t* output, size_t length,
+                    const uint8_t* tag, size_t tag_len);
+
 
 
