@@ -40,9 +40,18 @@
 | **MD5** | [C](c/MD5) | [JS](js/MD5) | [Analysis](README/MD5.md) | 广泛使用的消息摘要算法 |
 | **SHA-1** | [C](c/SHA1) | [JS](js/SHA1) | [Analysis](README/SHA1.md) | 安全哈希算法 1 |
 | **SHA-256** | [C](c/SHA256) | [JS](js/SHA256) | [Analysis](README/SHA256.md) | SHA-2 系列中最常用的变体 |
+| **SHA-384** | [C](c/SHA384) | [JS](js/SHA384) | [Analysis](README/SHA384.md) | SHA-2 系列 384 位输出，与 SHA-512 同核 |
+| **SHA-512** | [C](c/SHA512) | [JS](js/SHA512) | [Analysis](README/SHA512.md) | SHA-2 系列 512 位输出 (FIPS 180-4) |
+| **SHA3** | [C](c/SHA3) | [JS](js/SHA3) | [Analysis](README/SHA3.md) | SHA3-256 / SHA3-512 (FIPS 202, Keccak) |
 | **SM3** | [C](c/SM3) | [JS](js/SM3) | [Analysis](README/SM3.md) | 国密密码杂凑算法 |
 | **MurmurHash** | [C](c/murmurhash) | [JS](js/murmurhash) | [Analysis](README/MurmurHash.md) | 高性能非加密哈希算法 |
 | **CRC32** | [C](c/CRC32) | [JS](js/CRC32) | [Analysis](README/CRC32.md) | 循环冗余校验 (IEEE 802.3) |
+
+### 🔐 消息认证码 (MAC)
+
+| 算法 | C 实现 | JS 实现 | 详细分析 | 说明 |
+| :--- | :---: | :---: | :---: | :--- |
+| **HMAC** | [C](c/HMAC) | [JS](js/HMAC) | [Analysis](README/HMAC.md) | 基于哈希的 MAC (RFC 2104)，支持 SHA256/SHA384/SHA512 等 |
 
 ### 🔡 编码 (Encoding)
 
